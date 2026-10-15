@@ -29,7 +29,7 @@ jobs:
           echo "::add-mask::${{ secrets.DRONE_KEY }}"
           echo "::add-mask::${{ secrets.GEMINI_API_KEY }}"
           echo "::add-mask::${{ secrets.HIVE_URL }}"
-      - name: Run Scout
+      - name: Run drone
         env:
           HIVE_URL: ${{ secrets.HIVE_URL }}
           DRONE_KEY: ${{ secrets.DRONE_KEY }}
@@ -38,5 +38,4 @@ jobs:
           RUN_BUDGET_MS: "270000"
           ATTENTION_WAIT_MS: "900000"
           MAX_SESSION_MS: "1200000"
-          RUN_BUDGET_MS: "270000"
         run: node src/drone.mjs
