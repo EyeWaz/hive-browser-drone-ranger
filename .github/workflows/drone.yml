@@ -29,11 +29,13 @@ jobs:
           echo "::add-mask::${{ secrets.DRONE_KEY }}"
           echo "::add-mask::${{ secrets.GEMINI_API_KEY }}"
           echo "::add-mask::${{ secrets.HIVE_URL }}"
+          echo "::add-mask::${{ secrets.DRONE_STATE_KEY }}"
       - name: Run drone
         env:
           HIVE_URL: ${{ secrets.HIVE_URL }}
           DRONE_KEY: ${{ secrets.DRONE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DRONE_STATE_KEY: ${{ secrets.DRONE_STATE_KEY }}
           DRONE_NAME: Ranger
           RUN_BUDGET_MS: "270000"
           ATTENTION_WAIT_MS: "900000"

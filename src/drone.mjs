@@ -1,6 +1,37 @@
 // Hive browser drone (Scout / Ranger / Pixel). Secrets via Actions only.
 import { chromium } from "playwright";
 
+import { webcrypto as WC } from "node:crypto";
+const STATE_KEY = process.env.DRONE_STATE_KEY || "";
+let STATE_LOADED_AT = 0, STATE_FORGOTTEN = false;
+async function stateKey() { return WC.subtle.importKey("raw", Buffer.from(STATE_KEY, "base64"), "AES-GCM", false, ["encrypt", "decrypt"]); }
+async function loadState() {
+  STATE_LOADED_AT = Math.floor(Date.now() / 1000);
+  if (!STATE_KEY) { log("no DRONE_STATE_KEY: logins will not persist"); return undefined; }
+  try { const r = await hive("GET", "/api/drone/state"); if (!r.ok || !r.blob) return undefined;
+    const raw = Buffer.from(r.blob, "base64"); const pt = await WC.subtle.decrypt({ name: "AES-GCM", iv: raw.subarray(0, 12) }, await stateKey(), raw.subarray(12));
+    const st = JSON.parse(Buffer.from(pt).toString("utf8")); log("restored saved logins:", (st.cookies || []).length, "cookies"); return st;
+  } catch (e) { log("state restore failed (starting clean)"); return undefined; }
+}
+let lastStateHash = "";
+async function saveState(context, why) {
+  if (!STATE_KEY || STATE_FORGOTTEN || !context) return;
+  try { const st = await context.storageState(); const js = JSON.stringify(st);
+    const h = (await WC.subtle.digest("SHA-256", Buffer.from(js))).byteLength + ":" + js.length + ":" + Buffer.from(await WC.subtle.digest("SHA-256", Buffer.from(js))).toString("hex").slice(0, 16);
+    if (h === lastStateHash) return;
+    const iv = WC.getRandomValues(new Uint8Array(12)); const ct = new Uint8Array(await WC.subtle.encrypt({ name: "AES-GCM", iv }, await stateKey(), Buffer.from(js)));
+    const blob = Buffer.concat([Buffer.from(iv), Buffer.from(ct)]).toString("base64");
+    const r = await hive("PUT", "/api/drone/state", { blob, loaded_at: STATE_LOADED_AT });
+    if (r.ok) { lastStateHash = h; log("saved logins (" + why + "):", st.cookies.length, "cookies"); }
+    else if (r.error === "state_forgotten") { STATE_FORGOTTEN = true; await context.clearCookies().catch(() => {}); log("logins forgotten by Ron: cookies cleared"); }
+    else log("state save failed", r.error);
+  } catch (e) { log("state save error", mask(String(e.message))); }
+}
+async function checkForget(context, poll) { if (poll && poll.forget_at && poll.forget_at > STATE_LOADED_AT && !STATE_FORGOTTEN) { STATE_FORGOTTEN = true; await context.clearCookies().catch(() => {}); log("Forget logins: cookies cleared"); } }
+// ---------- tabs (popups open as tabs) ----------
+const TABS = { pages: [], cur: 0, ctx: null };
+const curPage = () => TABS.pages[TABS.cur] || TABS.pages[0];
+function trackPage(p) { if (TABS.pages.includes(p)) return; TABS.pages.push(p); TABS.cur = TABS.pages.length - 1; p.on("close", () => { const i = TABS.pages.indexOf(p); if (i >= 0) TABS.pages.splice(i, 1); if (TABS.cur >= TABS.pages.length) TABS.cur = Math.max(0, TABS.pages.length - 1); }); }
 const HIVE = process.env.HIVE_URL.replace(/\/$/, "");
 const KEY = process.env.DRONE_KEY;
 const GEMINI = process.env.GEMINI_API_KEY;
@@ -13,7 +44,7 @@ const MAX_SESSION_MS = Number(process.env.MAX_SESSION_MS || 1200000); // 20 min
 const start = Date.now();
 let hardDeadline = start + BASE_BUDGET_MS;
 const left = () => hardDeadline - Date.now();
-const mask = s => String(s || "").replace(KEY || "___", "[REDACTED]").replace(GEMINI || "___", "[REDACTED]");
+const mask = s => String(s || "").replace(KEY || "___", "[REDACTED]").replace(GEMINI || "___", "[REDACTED]").replace(STATE_KEY || "___", "[REDACTED]");
 const log = (...a) => console.log(...a.map(x => typeof x === "string" ? mask(x) : x));
 
 async function hive(method, path, body) {
@@ -48,7 +79,8 @@ async function think(prompt, { json = false, max = 1200 } = {}) {
 async function shot(page) {
   const buf = await page.screenshot({ type: "jpeg", quality: 45, fullPage: false });
   const vp = page.viewportSize() || { width: 1024, height: 640 };
-  return { jpeg_b64: buf.toString("base64"), w: vp.width, h: vp.height, url: page.url(), title: await page.title().catch(() => "") };
+  const tabs = []; for (const [i, p] of TABS.pages.entries()) tabs.push({ i, url: p.url(), title: await p.title().catch(() => ""), active: p === page });
+  return { jpeg_b64: buf.toString("base64"), w: vp.width, h: vp.height, url: page.url(), title: await page.title().catch(() => ""), tabs };
 }
 
 // Save a result or screenshot to the task's artifacts (guide #artifacts). Never throws.
@@ -71,7 +103,12 @@ async function runOne(page, c) {
     else if (c.type === "mousemove") await page.mouse.move(c.x, c.y);
     else if (c.type === "mousedown") await page.mouse.down({ button: c.button === 2 ? "right" : "left" });
     else if (c.type === "mouseup") await page.mouse.up({ button: c.button === 2 ? "right" : "left" });
-    else if (c.type === "type") await page.keyboard.type(c.text || "", { delay: 15 });
+    else if (c.type === "type") await page.keyboard.type(c.text || "", { delay: c.secret ? 25 : 15 });
+    else if (c.type === "paste") await page.keyboard.insertText(c.text || "");
+    else if (c.type === "newtab") { const np = await TABS.ctx.newPage(); trackPage(np); TABS.cur = TABS.pages.indexOf(np); if (c.url && c.url !== "about:blank") await np.goto(c.url, { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {}); }
+    else if (c.type === "switchtab") { if (TABS.pages[c.i]) { TABS.cur = c.i; await TABS.pages[c.i].bringToFront().catch(() => {}); } }
+    else if (c.type === "closetab") { if (TABS.pages.length > 1 && TABS.pages[c.i]) await TABS.pages[c.i].close().catch(() => {}); else { await ack(c.id, "failed", "can't close the last tab"); return; } }
+    else if (c.type === "savestate") { await saveState(TABS.ctx, "manual"); }
     else if (c.type === "key") {
       const mods = c.modifiers || [];
       for (const m of mods) await page.keyboard.down(m);
@@ -84,9 +121,9 @@ async function runOne(page, c) {
     else if (c.type === "back") await page.goBack({ waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
     else if (c.type === "handback") { await ack(c.id, "done", "handback"); return "handback"; }
     else { await ack(c.id, "failed", "unknown type " + c.type); return; }
-    await ack(c.id, "done", "ok");
+    await ack(c.id, "done", c.secret ? "ok (text redacted)" : "ok");
   } catch (e) {
-    await ack(c.id, "failed", mask(String(e.message)));
+    await ack(c.id, "failed", c.secret ? "failed (text redacted)" : mask(String(e.message)));
     log("cmd fail", c.type, c.id, mask(String(e.message)));
   }
 }
@@ -108,8 +145,10 @@ async function streamLoop(page, until) {
       await beat({ status: "working", status_text: "Session ending in about 60s unless you keep controlling." });
       log("warning: session ending in ~60s");
     }
+    page = curPage() || page;
     const fr = await shot(page);
     const r = await hive("POST", "/api/drone/frame", fr);
+    await checkForget(TABS.ctx, r);
     if (!r.ok) { await new Promise(r => setTimeout(r, 1200)); continue; }
     extendForSession(r);
     if (r.mode === "control") {
@@ -118,12 +157,13 @@ async function streamLoop(page, until) {
         extendForSession(p);
         if ((p.commands || []).length) {
           for (const c of p.commands) {
-            const hb = await runOne(page, c);
-            if (hb === "handback") return "handed";
+            const hb = await runOne(curPage() || page, c);
+            if (hb === "handback") { await saveState(TABS.ctx, "handback"); return "handed"; }
           }
+          page = curPage() || page;
           await shot(page).then(f => hive("POST", "/api/drone/frame", f));
         }
-        if (p.mode !== "control") break;
+        if (p.mode !== "control") { await saveState(TABS.ctx, "control ended"); break; }
         await new Promise(r => setTimeout(r, 400));
       }
     } else if (r.mode === "off" && !r.watch) {
@@ -271,12 +311,15 @@ async function main() {
       } catch { await hive("POST", `/api/messages/${m.id}/reply`, { body: "Got it. Brain error; will retry next run." }); }
     }
   }
-  if (hb.paused || hb.halted) { log("paused"); return; }
+  const noTasks = !!(hb.paused || hb.halted); // halted: still heartbeat, chat, memory, watch/control; just no claims
+  if (noTasks && !(hb.watch || hb.keep_alive || hb.live_mode === "control" || hb.live_mode === "attention")) { log("paused/halted: no claims"); return; }
   if (hb.training) await training(hb.training);
 
   const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
-  const context = await browser.newContext({ viewport: { width: 1024, height: 640 }, userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" });
-  const page = await context.newPage();
+  const saved = await loadState();
+  const context = await browser.newContext({ ...(saved ? { storageState: saved } : {}), viewport: { width: 1024, height: 640 }, userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" });
+  TABS.ctx = context; context.on("page", p => trackPage(p)); // popups become tabs
+  const page = await context.newPage(); trackPage(page);
   try {
     // Stay for watch/control first
     if (hb.watch || hb.keep_alive || hb.live_mode === "control" || hb.live_mode === "attention") {
@@ -284,7 +327,7 @@ async function main() {
       await page.goto("about:blank");
       await streamLoop(page, () => left() < 5000);
     }
-    for (let i = 0; i < 3 && left() > 60000; i++) {
+    for (let i = 0; i < 3 && left() > 60000 && !noTasks; i++) {
       // Re-check watch between tasks
       hb = await beat({ status: "idle", status_text: "Looking for work." });
       if (hb.watch || hb.keep_alive || hb.live_mode === "control") {
@@ -305,6 +348,7 @@ async function main() {
     }
   } finally {
     await releaseHeld("run finished before the task was reported").catch(() => {});
+    await saveState(context, "run end");
     await browser.close().catch(() => {});
   }
   await beat({ status: "idle", status_text: "Run finished. Backup cron every 30 minutes; Hive can wake sooner." });
