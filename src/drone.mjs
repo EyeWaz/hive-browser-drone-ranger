@@ -166,6 +166,23 @@ function syncContext(c) {
   return out.length ? out.join("\n\n").slice(0, 5000) + "\n\nDo not redo work already listed as done above. Avoid contacting or listing people others already handled.\n" : "";
 }
 
+const REASONS = ["login_wall", "captcha", "blocked_domain", "rate_limited", "missing_asset", "unclear", "tool_error", "needs_human", "other"];
+let held = null; // { id, done, next, where }
+async function report(id, rep) {
+  if (rep.outcome !== "done" && !REASONS.includes(rep.reason_code)) rep.reason_code = "other";
+  let r = await hive("POST", `/api/tasks/${id}/report`, rep);
+  if (!r.ok && rep.outcome === "done") r = await hive("POST", `/api/tasks/${id}/report`, { outcome: "failed", reason_code: "other", explanation: `Done report rejected (${r.error}). Result: ${String(rep.result || "").slice(0, 2500)}`, tried: "Finished the work; report was rejected.", proof: String(rep.proof || "see artifacts").slice(0, 1000) });
+  if (!r.ok && r.error !== "not_holding_task") log("report error", id, r.error, r.hint);
+  if (r.ok || r.error === "not_holding_task") held = null;
+  return r;
+}
+async function releaseHeld(reason) {
+  if (!held) return;
+  const r = await hive("POST", `/api/tasks/${held.id}/release`, { done: held.done || "started", next: held.next || "continue the task", where: held.where || "see task artifacts", reason });
+  log("released", held.id, r.ok ? "ok" : r.error);
+  held = null;
+}
+
 async function work(t, page) {
   if (t.practice) return doPractice(t);
   if (t.sensitive && !/\bdraft\b/i.test(t.title + " " + (t.description || ""))) {
@@ -177,13 +194,15 @@ async function work(t, page) {
   }
   const c = await hive("POST", `/api/tasks/${t.id}/claim`);
   if (!c.ok) return c;
+  if (c.resumed) log("resuming my own task", t.id);
+  held = { id: t.id };
   const sync = syncContext(c);
-  const cp = o => hive("POST", `/api/tasks/${t.id}/checkpoint`, o).catch(() => {});
+  const cp = o => { held = { id: t.id, done: o.done, next: o.next, where: o.where || (held && held.where) }; return hive("POST", `/api/tasks/${t.id}/checkpoint`, o).catch(() => {}); };
   try {
     await beat({ task_id: t.id, progress: "Planning", percent: 5 });
     const plan = await think(`Task ${t.id}: ${t.title}\n${t.description}\nDone when: ${t.definition_of_done}\nEarlier failures: ${prior.map(a => a.reason_code + ": " + a.explanation).join(" | ") || "none"}\n${sync}Plan public-web browse. JSON {"urls":["up to 5 https URLs"],"queries":["optional"],"needs_login":false,"notes":"..."}`, { json: true, max: 400 });
     if (plan.needs_login) {
-      await hive("POST", `/api/tasks/${t.id}/report`, { outcome: "failed", reason_code: "login_wall", explanation: plan.notes || "Needs a login.", tried: "Assessed.", proof: "plan" });
+      await report(t.id, { outcome: "failed", reason_code: "login_wall", explanation: plan.notes || "Needs a login.", tried: "Assessed.", proof: "plan" });
       return { ok: true };
     }
     const urls = [...(plan.urls || [])];
@@ -200,7 +219,7 @@ async function work(t, page) {
           await shotArtifact(t.id, page, `${t.id}-blocked-${texts.length + 1}.jpg`, "Blocked: " + page.url());
           const help = await askHelp(page, /captcha/i.test(body) ? "captcha" : "login wall");
           if (help === "needs_human") {
-            await hive("POST", `/api/tasks/${t.id}/report`, { outcome: "failed", reason_code: "needs_human", explanation: "Needed Ron; nobody took over in time.", tried: "Opened " + u, proof: u });
+            await report(t.id, { outcome: "failed", reason_code: "needs_human", explanation: "Needed Ron; nobody took over in time.", tried: "Opened " + u, proof: u });
             return { ok: true };
           }
         }
@@ -213,6 +232,7 @@ async function work(t, page) {
         }
       } catch (e) { texts.push({ url: u, error: String(e.message).slice(0, 200) }); }
     }
+    if (left() < 35000) { await shotArtifact(t.id, page, `${t.id}-partial.jpg`, "Last page before release"); await cp({ done: `${texts.length} pages read: ${texts.map(x => x.url).join(" ").slice(0, 400)}`, next: "write result from these pages", where: `artifact ${t.id}-partial.jpg` }); await releaseHeld("run time ending"); return { ok: true }; }
     await beat({ task_id: t.id, progress: "Writing result", percent: 80 });
     const out = await think(`Task ${t.id}: ${t.title}\nDone when: ${t.definition_of_done}\n${sync}Pages:\n${texts.map(t => `${t.url}\n${t.error || t.text}`).join("\n\n").slice(0, 14000)}\nJSON {"outcome":"done"|"failed","result":"...","proof":"urls","reason_code":"...","explanation":"...","tried":"...","subtasks":[]}`, { json: true, max: 1500 });
     let rep;
@@ -220,11 +240,12 @@ async function work(t, page) {
     else rep = { outcome: "failed", reason_code: out.reason_code || "other", explanation: String(out.explanation || "Not enough public info."), tried: String(out.tried || `Opened ${texts.length} pages.`), proof: texts.map(t => t.url).join(" ") };
     const art = await artifact(t.id, { name: `${t.id}-result.json`, note: `${NAME}: full output and pages read`, text: { task: t.id, outcome: rep.outcome, output: out, pages: texts.map(x => ({ url: x.url, ok: !x.error, error: x.error })) } });
     if (art.ok) rep.proof = (rep.proof + ` | artifact ${t.id}-result.json`).slice(0, 3990);
-    await hive("POST", `/api/tasks/${t.id}/report`, rep);
+    await report(t.id, rep);
     for (const s of (out.subtasks || []).slice(0, 2)) if (s?.title) await hive("POST", "/api/tasks/propose", { title: String(s.title).slice(0, 190), description: String(s.description || ""), required_skills: s.required_skills || ["browse"], project_id: t.project_id });
     return { ok: true };
   } catch (e) {
-    await hive("POST", `/api/tasks/${t.id}/report`, { outcome: "failed", reason_code: "tool_error", explanation: mask(String(e.message)).slice(0, 400), tried: "Browse loop.", proof: "error" });
+    if (left() < 20000) await releaseHeld("run ended during an error: " + mask(String(e.message)).slice(0, 120));
+    else await report(t.id, { outcome: "failed", reason_code: "tool_error", explanation: mask(String(e.message)).slice(0, 400), tried: "Browse loop.", proof: "error" });
     return { ok: false };
   }
 }
@@ -276,6 +297,7 @@ async function main() {
       await streamLoop(page, () => left() < 5000);
     }
   } finally {
+    await releaseHeld("run finished before the task was reported").catch(() => {});
     await browser.close().catch(() => {});
   }
   await beat({ status: "idle", status_text: "Run finished. Backup cron every 30 minutes; Hive can wake sooner." });
