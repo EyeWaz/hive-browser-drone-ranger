@@ -189,7 +189,8 @@ async function work(t, page) {
     return hive("POST", `/api/tasks/${t.id}/pass`, { reason: "Sensitive account action. I browse public pages only unless Ron takes control." });
   }
   const prior = (t.attempts || []).filter(a => a.outcome === "failed");
-  if (prior.some(a => String(a.drone).toLowerCase() === NAME.toLowerCase())) {
+  const mine = String(t.claimed_by || "").toLowerCase() === NAME.toLowerCase();
+  if (!mine && prior.some(a => String(a.drone).toLowerCase() === NAME.toLowerCase())) {
     return hive("POST", `/api/tasks/${t.id}/pass`, { reason: "I already failed this once. Leaving it for another drone." });
   }
   const c = await hive("POST", `/api/tasks/${t.id}/claim`);
