@@ -47,6 +47,14 @@ async function shot(page) {
   return { jpeg_b64: buf.toString("base64"), w: vp.width, h: vp.height, url: page.url(), title: await page.title().catch(() => "") };
 }
 
+// Save a result or screenshot to the task's artifacts (guide #artifacts). Never throws.
+async function artifact(taskId, body) {
+  try { const r = await hive("POST", `/api/tasks/${taskId}/artifacts`, body); if (!r.ok) log("artifact error", r.error); return r; } catch (e) { return { ok: false, error: String(e.message) }; }
+}
+async function shotArtifact(taskId, page, name, note) {
+  try { const buf = await page.screenshot({ type: "jpeg", quality: 55, fullPage: false }); if (buf.length > 1900000) return { ok: false }; return artifact(taskId, { name, mime: "image/jpeg", data_base64: buf.toString("base64"), note: String(note || page.url()).slice(0, 400) }); } catch (e) { return { ok: false }; }
+}
+
 async function ack(id, status, result) {
   await hive("POST", "/api/drone/commands/ack", { id, status, result: String(result || "").slice(0, 400) }).catch(() => {});
 }
@@ -175,6 +183,7 @@ async function work(t, page) {
         await page.waitForTimeout(600);
         const body = (await page.locator("body").innerText({ timeout: 5000 }).catch(() => "")).slice(0, 8000);
         if (/captcha|verify you are human|challenge-platform/i.test(body) || (/login|sign in/i.test(await page.title()) && /password/i.test(body))) {
+          await shotArtifact(t.id, page, `${t.id}-blocked-${texts.length + 1}.jpg`, "Blocked: " + page.url());
           const help = await askHelp(page, /captcha/i.test(body) ? "captcha" : "login wall");
           if (help === "needs_human") {
             await hive("POST", `/api/tasks/${t.id}/report`, { outcome: "failed", reason_code: "needs_human", explanation: "Needed Ron; nobody took over in time.", tried: "Opened " + u, proof: u });
@@ -182,6 +191,7 @@ async function work(t, page) {
           }
         }
         texts.push({ url: page.url(), text: (await page.locator("body").innerText({ timeout: 5000 }).catch(() => "")).slice(0, 5000) });
+        if (texts.filter(x => !x.error).length <= 2) await shotArtifact(t.id, page, `${t.id}-page-${texts.length}.jpg`, `Page ${texts.length}: ${page.url()}`);
         const hb = await beat({ task_id: t.id, progress: "Reading", percent: 50 });
         if (hb.watch || hb.live_mode === "attention" || hb.live_mode === "control" || hb.keep_alive) {
           await streamLoop(page, () => left() < 30000);
@@ -193,6 +203,8 @@ async function work(t, page) {
     let rep;
     if (out.outcome === "done" && out.result) rep = { outcome: "done", result: String(out.result).replace(/\u2014/g, ", "), proof: String(out.proof || texts.map(t => t.url).join(" ")) };
     else rep = { outcome: "failed", reason_code: out.reason_code || "other", explanation: String(out.explanation || "Not enough public info."), tried: String(out.tried || `Opened ${texts.length} pages.`), proof: texts.map(t => t.url).join(" ") };
+    const art = await artifact(t.id, { name: `${t.id}-result.json`, note: `${NAME}: full output and pages read`, text: { task: t.id, outcome: rep.outcome, output: out, pages: texts.map(x => ({ url: x.url, ok: !x.error, error: x.error })) } });
+    if (art.ok) rep.proof = (rep.proof + ` | artifact ${t.id}-result.json`).slice(0, 3990);
     await hive("POST", `/api/tasks/${t.id}/report`, rep);
     for (const s of (out.subtasks || []).slice(0, 2)) if (s?.title) await hive("POST", "/api/tasks/propose", { title: String(s.title).slice(0, 190), description: String(s.description || ""), required_skills: s.required_skills || ["browse"], project_id: t.project_id });
     return { ok: true };
