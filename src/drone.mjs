@@ -73,7 +73,8 @@ async function think(prompt, { json = false, max = 1200 } = {}) {
   const j = JSON.parse(t);
   const text = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("").replace(/\u2014/g, ", ");
   if (!json) return text.trim();
-  return JSON.parse(text.replace(/^```json\s*|```$/g, ""));
+  try { return JSON.parse(text.replace(/^```json\s*|```$/g, "")); }
+  catch (e) { if (max >= 8000 || prompt.includes("[SHORTER]")) throw e; log("json cut off, retrying shorter with more room"); return think(prompt + "\n[SHORTER] Your last answer was cut off. Keep every string compact and finish the JSON. Put long documents in the result as tight markdown under 3000 characters.", { json, max: 8000 }); }
 }
 
 async function shot(page) {
@@ -280,7 +281,7 @@ async function work(t, page) {
     }
     if (left() < 35000) { await shotArtifact(t.id, page, `${t.id}-partial.jpg`, "Last page before release"); await cp({ done: `${texts.length} pages read: ${texts.map(x => x.url).join(" ").slice(0, 400)}`, next: "write result from these pages", where: `artifact ${t.id}-partial.jpg` }); await releaseHeld("run time ending"); return { ok: true }; }
     await beat({ task_id: t.id, progress: "Writing result", percent: 80 });
-    const out = await think(`Task ${t.id}: ${t.title}\nDone when: ${t.definition_of_done}\n${sync}Pages:\n${texts.map(t => `${t.url}\n${t.error || t.text}`).join("\n\n").slice(0, 14000)}\nJSON {"lesson":"optional one-line reusable lesson for next time, or empty","outcome":"done"|"failed","result":"...","proof":"urls","reason_code":"...","explanation":"...","tried":"...","subtasks":[]}`, { json: true, max: 1500 });
+    const out = await think(`Task ${t.id}: ${t.title}\nDone when: ${t.definition_of_done}\n${sync}Pages:\n${texts.map(t => `${t.url}\n${t.error || t.text}`).join("\n\n").slice(0, 14000)}\nJSON {"lesson":"optional one-line reusable lesson for next time, or empty","outcome":"done"|"failed","result":"...","proof":"urls","reason_code":"...","explanation":"...","tried":"...","subtasks":[]}`, { json: true, max: 6000 });
     let rep;
     if (out.outcome === "done" && out.result) rep = { outcome: "done", result: String(out.result).replace(/\u2014/g, ", "), proof: String(out.proof || texts.map(t => t.url).join(" ")) };
     else rep = { outcome: "failed", reason_code: out.reason_code || "other", explanation: String(out.explanation || "Not enough public info."), tried: String(out.tried || `Opened ${texts.length} pages.`), proof: texts.map(t => t.url).join(" ") };
