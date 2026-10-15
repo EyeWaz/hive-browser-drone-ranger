@@ -1,0 +1,40 @@
+name: Ranger drone
+on:
+  schedule:
+    - cron: "*/30 * * * *"  # backup; Hive wakes via repository_dispatch
+  workflow_dispatch:
+  repository_dispatch:
+    types: [hive_wake]
+permissions:
+  contents: read
+concurrency:
+  group: ranger-drone
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          # cache disabled until lockfile committed
+      - name: Install
+        run: |
+          npm ci || npm i
+          npx playwright install --with-deps chromium
+      - name: Mask secrets
+        run: |
+          echo "::add-mask::${{ secrets.DRONE_KEY }}"
+          echo "::add-mask::${{ secrets.GEMINI_API_KEY }}"
+          echo "::add-mask::${{ secrets.HIVE_URL }}"
+      - name: Run Scout
+        env:
+          HIVE_URL: ${{ secrets.HIVE_URL }}
+          DRONE_KEY: ${{ secrets.DRONE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DRONE_NAME: Ranger
+          RUN_BUDGET_MS: "270000"
+          ATTENTION_WAIT_MS: "900000"
+        run: node src/drone.mjs
