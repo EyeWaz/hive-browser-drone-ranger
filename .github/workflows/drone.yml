@@ -37,4 +37,6 @@ jobs:
           DRONE_NAME: Ranger
           RUN_BUDGET_MS: "270000"
           ATTENTION_WAIT_MS: "900000"
+          MAX_SESSION_MS: "1200000"
+          RUN_BUDGET_MS: "270000"
         run: node src/drone.mjs
