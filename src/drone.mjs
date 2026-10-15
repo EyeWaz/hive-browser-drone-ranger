@@ -206,7 +206,10 @@ async function work(t, page) {
         }
         texts.push({ url: page.url(), text: (await page.locator("body").innerText({ timeout: 5000 }).catch(() => "")).slice(0, 5000) });
         if (texts.filter(x => !x.error).length <= 2) await shotArtifact(t.id, page, `${t.id}-page-${texts.length}.jpg`, `Page ${texts.length}: ${page.url()}`);
+<<<<<<< HEAD
+=======
         await cp({ done: `${texts.length} pages read, last ${page.url().slice(0, 120)}`, next: urls[texts.length] ? "open " + urls[texts.length].slice(0, 120) : "write result", percent: 20 + texts.length * 10 });
+>>>>>>> 12ea457 (Read project room context + resume info on claim; post progress checkpoints)
         const hb = await beat({ task_id: t.id, progress: "Reading", percent: 50 });
         if (hb.watch || hb.live_mode === "attention" || hb.live_mode === "control" || hb.keep_alive) {
           await streamLoop(page, () => left() < 30000);
